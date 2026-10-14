@@ -1,74 +1,3 @@
-# Elevator Group Control: Implementation Workflow
-
-```
-DESIGN_SPEC.md ─▶ Claude generates Quint spec ─▶ Quint model-checks
-      ─▶ Claude generates C++ ─▶ Quint emits ITF traces ─▶ C++ MBT driver replays
-      ─▶ PASS: done   |   FAIL: Claude fixes the C++ ─▶ repeat
-```
-
-Repository layout:
-
-```
-spec/elevator.qnt          Quint spec (generated in phase 2, never edited to make C++ pass)
-docs/DESIGN_SPEC.md        design doc, input of phase 2
-include/elevator/          production headers
-src/                       production code
-tests/TestSupport.hpp      invariants + JSON diagnostics (tests only)
-tests/ElevatorTests.cpp    unit and scenario tests
-tests/MBTDriver.cpp        replays Quint traces against the C++ code
-traces/                    ITF traces from Quint (committed)
-scripts/mbt.sh             one iteration of the loop
-CMakeLists.txt
-```
-
----
-
-## 1. Phase 1 — The Design Doc
-
-`docs/DESIGN_SPEC.md` describes the behavior only: types, state variables,
-operations with preconditions and effects, invariants, witnesses, and test
-scenarios. It does not mention any implementation language.
-
----
-
-## 2. Phase 2 — Claude Generates the Quint Spec
-
-### What to ask Claude
-
-```
-Here is the design doc: [paste docs/DESIGN_SPEC.md]
-
-Generate spec/elevator.qnt exactly as the doc requires. Nothing else.
-```
-
----
-
-## 3. Phase 3 — Quint Model-Checks the Spec
-
-The spec must be correct on its own before any C++ exists.
-
-```bash
-quint typecheck spec/elevator.qnt
-quint test spec/elevator.qnt
-quint run spec/elevator.qnt --invariant=safety --max-samples=1000 --max-steps=60
-quint run spec/elevator.qnt --invariant=witnessBothRunning     # must be violated
-quint run spec/elevator.qnt --invariant=witnessHallCallServed  # must be violated
-quint run spec/elevator.qnt --invariant=witnessStaleKnowledge  # must be violated
-```
-
-If anything fails here, fix the spec (phase 2), not the code.
-
----
-
-## 4. Phase 4 — Claude Generates the C++ Implementation
-
-Rather than writing the C++ by hand, ask Claude to derive it from the verified
-Quint spec. The implementation then starts with the same structure as the
-model, which is what makes trace replay possible.
-
-### What to ask Claude
-
-```
 Here is a verified Quint spec for an elevator group: [paste spec/elevator.qnt]
 Here is the original design doc: [paste docs/DESIGN_SPEC.md]
 
@@ -87,17 +16,99 @@ Generate a C++20 implementation with these requirements:
 
 2. A class `ElevatorSystem` in `include/elevator/elevator_system.hpp`.
 
-3. Methods corresponding to each Quint action, same name, same parameters:
-   - `void init()`
-   - `bool pressHallButton(HallCall)`, `bool pressCarButton(ElevatorId, int)`
-   - `bool receiveHallCall(HallCall)`, `bool assignTo(HallCall, ElevatorId)`,
-     `bool receiveStatus(StatusMsg)`, `bool receiveServed(ServedMsg)`
-   - `bool receiveAssign(AssignMsg)`, `bool departure(ElevatorId)`, `bool travel(ElevatorId)`,
-     `bool openDoor(ElevatorId)`, `bool closeDoor(ElevatorId)`
-   - `bool deliver(Message)`
+3. Methods corresponding to each Quint action, same name, same parameters.
    Every method returns false and leaves the state untouched if the
-   precondition fails. `assignCall`, `deliverAny` and `step` get no method:
-   their nondeterministic choice is made by the caller.
+   precondition fails; otherwise it applies the effect and returns true.
+   A method given an unknown elevator name returns false. Anything a method
+   does not mention stays unchanged.
+
+   - `void init()`: puts the system into the initial state. Every car is on
+     the bottom floor with the door closed, the motor stopped, heading `Idle`,
+     no car calls, no hall stops and `statusSeq` 0. The dispatcher has nothing
+     pending, nothing assigned, and knows every elevator to be on the bottom
+     floor with `seq` 0. No hall lamp is lit and the network is empty. The
+     constructor calls it.
+
+   - `bool pressHallButton(HallCall c)`: a passenger presses a hall button.
+     Precondition: `c` is a valid hall call and its lamp is not lit.
+     Effect: the lamp of `c` is lit and a `HallCallMsg` with `c` is put into
+     the network.
+
+   - `bool pressCarButton(ElevatorId e, int f)`: a passenger in car `e`
+     selects floor `f`; allowed while the car is moving.
+     Precondition: `f` is a floor of the building, it is not the car's
+     current floor, and it is not already among the car's `carCalls`.
+     Effect: `f` is added to the car's `carCalls`.
+
+   - `bool receiveHallCall(HallCall c)`: the dispatcher receives a hall call.
+     Precondition: a `HallCallMsg` with `c` is in the network.
+     Effect: that message is removed from the network. If `c` is neither in
+     `pending` nor a key of `assigned`, it is added to `pending`; otherwise
+     the dispatcher does not change.
+
+   - `bool assignTo(HallCall c, ElevatorId e)`: the dispatcher gives a pending
+     call to elevator `e`. This also implements Quint `assignCall(c)`, whose
+     nondeterministic choice `target` is passed in as `e`.
+     Precondition: `c` is in `pending` and `e` is one of
+     `closestElevators(dispatcher, c.floor)`.
+     Effect: `c` is removed from `pending`, `assigned[c]` becomes `e`, and an
+     `AssignMsg` for `e` and `c` is put into the network.
+
+   - `bool receiveStatus(StatusMsg s)`: the dispatcher receives a position
+     report.
+     Precondition: `s` is in the network.
+     Effect: `s` is removed from the network. If `s.seq` is greater than the
+     `seq` in `known[s.elevator]`, then `known[s.elevator]` becomes `s.floor`
+     and `s.seq`. Otherwise the report is outdated and is ignored.
+
+   - `bool receiveServed(ServedMsg s)`: the dispatcher learns that a call was
+     served.
+     Precondition: `s` is in the network.
+     Effect: `s` is removed from the network, `s.call` is removed from
+     `assigned`, and the lamp of `s.call` goes off.
+
+   - `bool receiveAssign(AssignMsg a)`: an elevator receives an assignment.
+     Precondition: `a` is in the network.
+     Effect: `a` is removed from the network and `a.call` is added to the
+     `hallStops` of the car `a.elevator`.
+
+   - `bool departure(ElevatorId e)`: car `e` starts moving.
+     Precondition: the motor is stopped, the door is closed, the car has at
+     least one target, and its current floor is not one of its targets.
+     Effect: the motor is running and the heading becomes `GoingUp` or
+     `GoingDown` according to `nextDir` of the car.
+
+   - `bool travel(ElevatorId e)`: car `e` moves by one floor.
+     Precondition: the motor is running.
+     Effect: the new floor is the current floor plus `delta` of the heading.
+     The car's floor becomes the new floor. If the new floor is one of the
+     car's targets, computed before the move, the motor stops; otherwise it
+     keeps running. `statusSeq` increases by one, and a `StatusMsg` with the
+     car's name, the new floor and the new `statusSeq` is put into the
+     network.
+
+   - `bool openDoor(ElevatorId e)`: car `e` opens its doors at a target floor.
+     Precondition: the motor is stopped, the door is closed, and the current
+     floor is one of the car's targets.
+     Effect: the served calls are the car's `hallStops` on the current floor.
+     The current floor is removed from `carCalls` and the served calls are
+     removed from `hallStops`. The door opens. If the car has no targets left,
+     the heading becomes `Idle`; otherwise it stays as it was. For every
+     served call a `ServedMsg` with the car's name and that call is put into
+     the network.
+
+   - `bool closeDoor(ElevatorId e)`: car `e` closes its doors.
+     Precondition: the door is open.
+     Effect: the door is closed.
+
+   - `bool deliver(Message m)`: the network delivers message `m`. This also
+     implements Quint `deliverAny`, whose nondeterministic choice `m` is
+     passed in.
+     Effect: calls `receiveHallCall`, `receiveAssign`, `receiveStatus` or
+     `receiveServed` depending on the kind of `m`, and returns its result.
+
+   `assignCall`, `deliverAny` and `step` get no method of their own: their
+   nondeterministic choice is made by the caller.
 
 4. Public const accessors for every Quint state variable:
    - `elevators() const`   (maps to Quint var `elevators`)
@@ -108,8 +119,19 @@ Generate a C++20 implementation with these requirements:
    because the C++ test driver will compare them to ITF trace state by name.
 
 5. Pure helpers as free functions with the Quint names:
-   `delta`, `isValidHallCall`, `allHallCalls` (Quint `HALL_CALLS`), `targets`,
-   `nextDir`, `closestElevators`.
+   - `delta(Heading)`: 1 for `GoingUp`, -1 for `GoingDown`, 0 for `Idle`.
+   - `isValidHallCall(Config, HallCall)`: true when the floor exists, the call
+     is not `Up` on the top floor, and not `Down` on the bottom floor.
+   - `allHallCalls(Config)` (Quint `HALL_CALLS`): every valid hall call.
+   - `targets(ElevatorState)`: the car's `carCalls` together with the floors
+     of all its `hallStops`.
+   - `nextDir(ElevatorState)`, the SCAN rule: if the car is going up and has
+     a target above it, `Up`; otherwise, if it is going down and has a target
+     below it, `Down`; otherwise, if it has any target above it, `Up`;
+     otherwise `Down`.
+   - `closestElevators(Config, DispatcherState, floor)`: the elevators whose
+     floor in `known` is at the smallest distance from `floor`; all of them
+     when several are equally close. Uses only the dispatcher's knowledge.
 
 6. Preconditions enforced identically to the Quint guards. `travel` has no
    shaft-bounds check, exactly like the spec.
@@ -124,174 +146,3 @@ Generate a C++20 implementation with these requirements:
 
 9. `include/` and `src/` contain production code only: no invariants, no JSON,
    no trace parsing, no test helpers.
-```
-
-### The Generated C++ Header
-
-The critical requirement is that every Quint `var` has a corresponding
-accessor with the same name, and every Quint action a method with the same name.
-
-```cpp
-class ElevatorSystem {
-public:
-    explicit ElevatorSystem(Config cfg = {});
-
-    const Config& config() const;
-    const SystemState& state() const;
-
-    // One accessor per Quint state variable, named exactly like the variable.
-    const std::map<ElevatorId, ElevatorState>& elevators() const;
-    const DispatcherState& dispatcher() const;
-    const std::set<HallCall>& hallLamps() const;
-    const std::set<Message>& network() const;
-
-    // Quint: init
-    void init();
-    // Quint: pressHallButton(c)
-    bool pressHallButton(const HallCall& c);
-    // Quint: assignTo(c, e); assignCall(c) picks e and calls this
-    bool assignTo(const HallCall& c, const ElevatorId& e);
-    // Quint: travel(e)
-    bool travel(const ElevatorId& e);
-    // ... one method per remaining Quint action
-};
-```
-
----
-
-## 5. Phase 5 — Claude Generates the Tests
-
-### What to ask Claude
-
-```
-Using spec/elevator.qnt and the C++ headers, generate:
-
-1. `tests/TestSupport.hpp` (header-only, namespace `elevator::test`):
-   - one `bool` function per Quint safety invariant, same name,
-     taking `(const Config&, const SystemState&)`
-   - `violatedInvariants(cfg, state)` returning the names of violated invariants
-   - `toJson(...)` for `HallCall`, `Message`, `SystemState` (readable, for reports)
-
-2. `tests/ElevatorTests.cpp` (GoogleTest):
-   - unit tests for every pure helper
-   - every Quint `run` test, step by step; where Quint expects `.fail()`,
-     assert the method returns false and the state is unchanged
-   - one extra scenario: a stale StatusMsg is discarded
-```
-
----
-
-## 6. Phase 6 — Quint Emits ITF Traces
-
-```bash
-quint run spec/elevator.qnt --mbt \
-  --max-samples=50 --n-traces=50 --max-steps=60 \
-  --out-itf=traces/trace_{seq}.itf.json
-```
-
-Every state in a trace contains the four state variables plus:
-
-- `mbt::actionTaken`: the action of `step` that produced the state (`init` first)
-- `mbt::nondetPicks`: one field per nondet name (`e`, `f`, `c`, `target`, `m`),
-  each `{"tag":"Some","value":...}` or `{"tag":"None","value":{"#tup":[]}}`
-
-ITF value encoding:
-
-| Quint            | ITF JSON |
-|------------------|----------|
-| `int`            | `{"#bigint": "3"}` |
-| `Set`            | `{"#set": [...]}` |
-| map              | `{"#map": [[key, value], ...]}` |
-| record           | plain object |
-| variant          | `{"tag": "Going", "value": {"tag": "Up", "value": {"#tup": []}}}` |
-
----
-
-## 7. Phase 7 — Claude Generates the MBT Driver
-
-### What to ask Claude
-
-```
-Here is the Quint spec: [paste spec/elevator.qnt]
-Here is the C++ header: [paste include/elevator/elevator_system.hpp]
-Here is one trace: [paste traces/trace_0.itf.json]
-
-Generate `tests/MBTDriver.cpp` (GoogleTest + nlohmann_json) that:
-
-1. Discovers `*.itf.json` in env `MBT_TRACES_DIR`, falling back to the
-   compile definition `MBT_DEFAULT_TRACES_DIR`; one parameterized test per file.
-   A separate test fails if no traces are found.
-2. Parses ITF into the C++ types (inline in this file, not in src/).
-3. Calls `init()` and compares it with state 0.
-4. For every next state, maps `mbt::actionTaken` + `mbt::nondetPicks` to a C++ call:
-   | actionTaken       | C++ call |
-   |-------------------|----------|
-   | pressHallButton   | pressHallButton(c) |
-   | pressCarButton    | pressCarButton(e, f) |
-   | assignCall        | assignTo(c, target) |
-   | departure, travel, openDoor, closeDoor | same method with e |
-   | deliverAny        | deliver(m) |
-5. After each call asserts, in order:
-   - the call returned true ("guard mismatch" otherwise)
-   - every accessor equals the trace variable of the same name;
-     the message lists the differing variables
-   - no invariant from TestSupport.hpp is violated
-6. On failure prints `=== MBT DIVERGENCE ===` with trace, step, action, C++ call,
-   state before, expected (Quint), actual (C++) and `json::diff(actual, expected)`.
-7. Prints `[   MBT    ] <file>: <n> steps replayed` per trace and a final
-   summary with the count of every action.
-```
-
-### The Generated Comparison
-
-Comparison goes through the accessors, variable by variable:
-
-```cpp
-check(sys.elevators()  == expected.elevators,  "elevators");
-check(sys.dispatcher() == expected.dispatcher, "dispatcher");
-check(sys.hallLamps()  == expected.hallLamps,  "hallLamps");
-check(sys.network()    == expected.network,    "network");
-```
-
----
-
-## 8. Phase 8 — Build and Run the Loop
-
-`CMakeLists.txt` (CMake 3.24+, C++20) fetches dependencies with `FetchContent`:
-
-- `nlohmann_json` 3.12.0 (`json.tar.xz` release asset)
-- GoogleTest 1.17.0
-
-| Target           | Sources                    | Links |
-|------------------|----------------------------|-------|
-| `elevator`       | `src/*.cpp`                | nothing |
-| `elevator_tests` | `tests/ElevatorTests.cpp`  | `elevator`, `nlohmann_json`, `GTest::gtest_main` |
-| `mbt_driver`     | `tests/MBTDriver.cpp`      | `elevator`, `nlohmann_json`, `GTest::gtest_main` |
-
-`scripts/mbt.sh` runs one iteration: typecheck, `quint test`, `quint run`
-on `safety`, regenerate `traces/`, build, run `elevator_tests`, run
-`mbt_driver` (log in `build/mbt_last.log`), print `MBT: PASS/FAIL` and
-`UNIT: PASS/FAIL`.
-
-```bash
-./scripts/mbt.sh
-N_TRACES=100 MAX_STEPS=80 SEED=42 ./scripts/mbt.sh
-```
-
----
-
-## 9. Phase 9 — Claude Fixes the C++
-
-### What to ask Claude
-
-```
-The MBT driver failed. Here is the log: [paste first === MBT DIVERGENCE === block]
-Here is the Quint spec: [paste spec/elevator.qnt]
-
-Find the Quint action named in the report, compare its guard and effect with
-the C++ method that was called, and fix the C++ code. Do not modify the spec,
-the traces, or the driver.
-```
-
-Repeat phases 6 to 9 until both `MBT` and `UNIT` pass. Commit `traces/` with the
-code; `build/`, `_apalache-out/`, `.cache/` are ignored.

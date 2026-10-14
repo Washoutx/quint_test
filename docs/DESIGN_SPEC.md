@@ -2,231 +2,291 @@
 
 ## Overview
 
-A building with `NUM_FLOORS` floors served by a group of elevators. Every floor
-has hall buttons (Up and Down), every car has a panel with one button per floor.
+A building with four floors is served by two elevators, called "A" and "B".
+Every floor has hall buttons for going up and going down, and every car has a
+panel with one button per floor.
 
-- **Hall panels** light a lamp and send a hall call to the dispatcher.
-- **The dispatcher** assigns every hall call to exactly one elevator: the one
-  closest to the calling floor according to its own, possibly stale, knowledge.
-- **Elevator controllers** move their car floor by floor using SCAN, open the
-  doors at target floors, and report position and served calls back.
+- **Hall panels**: when a passenger presses a hall button, its lamp lights up
+  and a hall call is sent to the dispatcher.
+- **The dispatcher** collects hall calls and gives each of them to exactly one
+  elevator: the one that is closest to the calling floor, judged by the last
+  position the dispatcher has heard from each elevator. That knowledge may be
+  out of date.
+- **Elevator controllers**: every car moves floor by floor using the SCAN
+  algorithm (keep going in the same direction while there is work ahead, then
+  turn around), opens its doors at the floors it has to serve, and reports its
+  position and the calls it has served back to the dispatcher.
 
-The dispatcher and the elevators communicate only through an asynchronous
-network: messages may be delivered in any order and after any delay, but are
-never lost or duplicated. Car buttons are handled locally by the car.
+The dispatcher and the elevators talk only through an asynchronous network.
+Messages can arrive in any order and after any delay, but they are never lost
+and never duplicated. Car buttons are handled by the car itself and never go
+through the dispatcher.
 
-Out of scope: passengers as entities, load, real time, failures, reassigning a
-call once assigned, and direction when serving (a stopped car serves all its
-hall calls on that floor).
+Out of scope: passengers as individuals, load, real time (speed, door timers),
+failures of any part, moving a call to another elevator once it has been
+given out, and the direction of a hall call when serving it (a car that stops
+at a floor serves all of its hall calls there).
 
 ## Types
 
-- `Dir = Up | Down`
-- `Heading = Going(Dir) | Idle`: direction the car is committed to. Set on
-  departure, reset to `Idle` when the car runs out of work.
-- `Door = Open | Closed`
-- `Motor = Stopped | Running`
-- `HallCall = { floor: int, dir: Dir }`
-- `ElevatorState = { floor: int, door: Door, motor: Motor, heading: Heading,
-  carCalls: Set[int], hallStops: Set[HallCall], statusSeq: int }`
-- `PositionReport = { floor: int, seq: int }`
-- `DispatcherState = { pending: Set[HallCall], assigned: HallCall -> str,
-  known: str -> PositionReport }`
-- `Message =`
-  - `HallCallMsg(HallCall)`: hall panel to dispatcher
-  - `AssignMsg({ elevator: str, call: HallCall })`: dispatcher to elevator
-  - `StatusMsg({ elevator: str, floor: int, seq: int })`: elevator to dispatcher
-  - `ServedMsg({ elevator: str, call: HallCall })`: elevator to dispatcher
+- `Dir`: `Up` or `Down`.
+- `Heading`: either `Going` with a `Dir`, or `Idle`. It is the direction the
+  car is committed to. It is chosen when the car departs and goes back to
+  `Idle` when the car has no more work. An `Idle` car may already have new
+  work that arrived while it was standing still.
+- `Door`: `Open` or `Closed`.
+- `Motor`: `Stopped` or `Running`.
+- `HallCall`: a record with a `floor` and a `dir`, meaning "someone on this
+  floor wants to go in this direction".
+- `ElevatorState`: a record describing one car:
+  - `floor`: the floor the car is at; while moving, the last floor it reached,
+  - `door`: whether the door is open or closed,
+  - `motor`: whether the car is moving,
+  - `heading`: the direction the car is committed to,
+  - `carCalls`: the floors selected inside the car that have not been served,
+  - `hallStops`: the hall calls given to this car that have not been served,
+  - `statusSeq`: the number of the last position report this car has sent.
+- `PositionReport`: a record with a `floor` and a `seq`: where the dispatcher
+  believes an elevator is, and which report that belief came from.
+- `DispatcherState`: a record with
+  - `pending`: hall calls received but not yet given to any elevator,
+  - `assigned`: a map from a hall call to the name of the elevator it was
+    given to, kept until the elevator confirms the call was served,
+  - `known`: a map from every elevator name to its last known position report.
+- `Message`: one of four kinds:
+  - `HallCallMsg` carries a `HallCall`, from a hall panel to the dispatcher,
+  - `AssignMsg` carries an `elevator` name and a `call`, from the dispatcher
+    to that elevator,
+  - `StatusMsg` carries an `elevator` name, a `floor` and a `seq`, from an
+    elevator to the dispatcher,
+  - `ServedMsg` carries an `elevator` name and a `call`, from an elevator to
+    the dispatcher.
 
 ## Constants
 
-- `NUM_FLOORS = 4`, `BOTTOM = 0`, `TOP = NUM_FLOORS - 1`
-- `FLOORS = BOTTOM..TOP`
-- `ELEVATORS = { "A", "B" }`
+- `NUM_FLOORS` is 4.
+- `BOTTOM` is floor 0 and `TOP` is the highest floor, floor 3.
+- `FLOORS` are all floors from the bottom to the top.
+- `ELEVATORS` are the names "A" and "B".
 
 ## State Variables
 
-- `elevators` (`str -> ElevatorState`): state of every car.
-- `dispatcher` (`DispatcherState`): calls pending, calls assigned, and the last
-  known position of every elevator.
-- `hallLamps` (`Set[HallCall]`): lit hall button lamps.
-- `network` (`Set[Message]`): messages in flight. Sending adds a message,
-  delivery removes it; any message may be delivered next.
+- `elevators`: the state of every car, by name.
+- `dispatcher`: the dispatcher's state.
+- `hallLamps`: the hall button lamps that are currently lit.
+- `network`: the messages currently in flight. Sending puts a message into
+  it, delivering takes one out. Any message in it may be delivered next.
 
-### Init
+### Initial state
 
-- every car: `floor = BOTTOM`, `door = Closed`, `motor = Stopped`,
-  `heading = Idle`, `carCalls = {}`, `hallStops = {}`, `statusSeq = 0`
-- `dispatcher = { pending: {}, assigned: {}, known: every e -> { floor: BOTTOM, seq: 0 } }`
-- `hallLamps = {}`, `network = {}`
+- Both cars stand on the bottom floor with the door closed, the motor
+  stopped, heading `Idle`, no car calls, no hall stops, and report number 0.
+- The dispatcher has nothing pending and nothing assigned, and believes both
+  elevators are on the bottom floor, with report number 0.
+- No hall lamp is lit and the network is empty.
 
 ## Helpers
 
-- `abs(x)`: absolute value.
-- `isValidHallCall(c)`: `c.floor ∈ FLOORS`, not `(c.floor = TOP ∧ c.dir = Up)`,
-  not `(c.floor = BOTTOM ∧ c.dir = Down)`.
+- `abs`: the absolute value of a number.
+- `isValidHallCall`: a hall call is valid when its floor exists, it is not an
+  up call on the top floor, and it is not a down call on the bottom floor.
 - `HALL_CALLS`: all valid hall calls.
-- `targets(es) = es.carCalls ∪ { c.floor | c ∈ es.hallStops }`
-- `delta(h)`: `+1` for `Going(Up)`, `-1` for `Going(Down)`, `0` for `Idle`.
-- `nextDir(es)` (SCAN), with `above` / `below` meaning some target is above /
-  below `es.floor`:
-  1. `heading = Going(Up) ∧ above` → `Up`
-  2. `heading = Going(Down) ∧ below` → `Down`
-  3. `above` → `Up`
-  4. otherwise → `Down`
-- `closestElevators(d, floor)`: all `e` minimizing
-  `abs(d.known[e].floor - floor)`. Uses only the dispatcher's knowledge.
-- `without(m, k)`: map `m` with key `k` removed.
+- `targets`: the floors a car has to stop at: all its car calls together with
+  the floors of all its hall stops.
+- `delta`: how a heading moves the car: one floor up for going up, one floor
+  down for going down, nothing for idle.
+- `nextDir` (SCAN): the direction a car should take next.
+  1. If it is going up and has a target above it, it goes up.
+  2. Otherwise, if it is going down and has a target below it, it goes down.
+  3. Otherwise, if it has any target above it, it goes up.
+  4. Otherwise it goes down.
+- `closestElevators`: for a given floor, the elevators whose position, as the
+  dispatcher knows it, is nearest to that floor. When several are equally
+  near, all of them are returned. Only the dispatcher's knowledge is used,
+  never the real positions of the cars.
+- `without`: a map of assigned calls with one call removed.
 
-Notation: `es = elevators[e]`. Every operation leaves all variables it does not
-mention unchanged.
+Every operation below leaves unchanged everything it does not mention.
 
 ## Operations
 
 ### Passengers
 
 #### pressHallButton(c)
-- **Precondition**: `c ∈ HALL_CALLS ∧ c ∉ hallLamps` (pressing a lit button is not possible)
-- **Effect**: `hallLamps' = hallLamps ∪ {c}`, `network' = network ∪ {HallCallMsg(c)}`
+- **Precondition**: `c` is a valid hall call and its lamp is not lit. Pressing
+  a button that is already lit is therefore not possible.
+- **Effect**: the lamp of `c` lights up and a `HallCallMsg` for `c` is sent.
 
 #### pressCarButton(e, f)
-- **Precondition**: `f ∈ FLOORS ∧ f ≠ es.floor ∧ f ∉ es.carCalls` (allowed while moving)
-- **Effect**: `es.carCalls' = es.carCalls ∪ {f}`
+- **Precondition**: floor `f` exists, the car `e` is not on that floor, and `f`
+  is not already selected in that car. This is allowed while the car moves.
+- **Effect**: `f` is added to the car calls of `e`.
 
 ### Dispatcher
 
 #### receiveHallCall(c)
-- **Precondition**: `HallCallMsg(c) ∈ network`
-- **Effect**: `network' = network \ {HallCallMsg(c)}`; if `c ∉ pending ∧ c ∉ keys(assigned)`
-  then `pending' = pending ∪ {c}`
+- **Precondition**: a `HallCallMsg` for `c` is in the network.
+- **Effect**: the message is taken out of the network. If the dispatcher has
+  neither pending nor assigned `c` already, `c` becomes pending. Otherwise
+  nothing else changes.
 
 #### assignTo(c, e)
-- **Precondition**: `c ∈ pending ∧ e ∈ closestElevators(dispatcher, c.floor)`
-- **Effect**: `pending' = pending \ {c}`, `assigned' = assigned[c ↦ e]`,
-  `network' = network ∪ {AssignMsg({ elevator: e, call: c })}`
+- **Precondition**: `c` is pending and `e` is one of the closest elevators to
+  the floor of `c`.
+- **Effect**: `c` is no longer pending, it is recorded as assigned to `e`, and
+  an `AssignMsg` telling `e` to serve `c` is sent.
 
 #### assignCall(c)
-- **Effect**: `nondet target ∈ closestElevators(dispatcher, c.floor)`, then `assignTo(c, target)`
+- **Effect**: one of the closest elevators to the floor of `c` is chosen non
+  deterministically, this choice is named `target`, and `assignTo(c, target)`
+  is performed.
 
 #### receiveStatus(s)
-- **Precondition**: `StatusMsg(s) ∈ network`
-- **Effect**: `network' = network \ {StatusMsg(s)}`; if `s.seq > known[s.elevator].seq`
-  then `known'[s.elevator] = { floor: s.floor, seq: s.seq }`, otherwise the report is
-  stale and ignored
+- **Precondition**: the `StatusMsg` `s` is in the network.
+- **Effect**: the message is taken out of the network. If its report number is
+  higher than the one the dispatcher knows for that elevator, the dispatcher
+  now believes the elevator is on the reported floor, with the new report
+  number. Otherwise the report is outdated and is ignored.
 
 #### receiveServed(s)
-- **Precondition**: `ServedMsg(s) ∈ network`
-- **Effect**: `network' = network \ {ServedMsg(s)}`, `assigned' = without(assigned, s.call)`,
-  `hallLamps' = hallLamps \ {s.call}` (the lamp goes off only now)
+- **Precondition**: the `ServedMsg` `s` is in the network.
+- **Effect**: the message is taken out of the network, the call is no longer
+  assigned, and its hall lamp goes off. The lamp goes off only now, not when
+  the doors open; until then, pressing the same hall button again has no
+  effect.
 
 ### Elevator controller
 
 #### receiveAssign(a)
-- **Precondition**: `AssignMsg(a) ∈ network`
-- **Effect**: `network' = network \ {AssignMsg(a)}`,
-  `elevators[a.elevator].hallStops' = hallStops ∪ {a.call}`
+- **Precondition**: the `AssignMsg` `a` is in the network.
+- **Effect**: the message is taken out of the network and the call is added to
+  the hall stops of the elevator named in it.
 
 #### departure(e)
-- **Precondition**: `es.motor = Stopped ∧ es.door = Closed ∧ targets(es) ≠ {} ∧ es.floor ∉ targets(es)`
-- **Effect**: `es.motor' = Running`, `es.heading' = Going(nextDir(es))`
+- **Precondition**: the car `e` is stopped, its door is closed, it has at
+  least one target, and its current floor is not a target. Work on the
+  current floor has to be done first, by opening the doors.
+- **Effect**: the motor starts and the heading becomes going in the direction
+  chosen by `nextDir`.
 
 #### travel(e)
-- **Precondition**: `es.motor = Running`
-- **Effect**, with `newFloor = es.floor + delta(es.heading)`:
-  - `es.floor' = newFloor`
-  - `es.motor' = Stopped` if `newFloor ∈ targets(es)`, else `Running`
-  - `es.statusSeq' = es.statusSeq + 1`
-  - `network' = network ∪ {StatusMsg({ elevator: e, floor: newFloor, seq: es.statusSeq + 1 })}`
-- No shaft-bounds check on purpose; INV-02 checks it.
+- **Precondition**: the car `e` is running.
+- **Effect**:
+  - the car moves one floor in the direction of its heading,
+  - if the new floor is one of its targets (as they were before this move),
+    the motor stops; otherwise the car keeps running,
+  - its report number goes up by one,
+  - a `StatusMsg` with the car's name, the new floor and the new report number
+    is sent to the dispatcher.
+- There is deliberately no check that the new floor exists. That a car never
+  leaves the building follows from the rest of the rules and is checked by
+  INV-02.
 
 #### openDoor(e)
-- **Precondition**: `es.motor = Stopped ∧ es.door = Closed ∧ es.floor ∈ targets(es)`
-- **Effect**, with `served = { c ∈ es.hallStops | c.floor = es.floor }`:
-  - `es.carCalls' = es.carCalls \ {es.floor}`, `es.hallStops' = es.hallStops \ served`
-  - `es.door' = Open`
-  - `es.heading' = Idle` if `targets(es') = {}`, else unchanged
-  - `network' = network ∪ { ServedMsg({ elevator: e, call: c }) | c ∈ served }`
+- **Precondition**: the car `e` is stopped, its door is closed, and its current
+  floor is one of its targets.
+- **Effect**:
+  - the car call for the current floor is removed,
+  - all hall stops of the car on the current floor are served and removed,
+  - the door opens,
+  - if the car has no targets left, its heading becomes `Idle`; otherwise the
+    heading stays as it was,
+  - a `ServedMsg` is sent for every hall call that was served.
 
 #### closeDoor(e)
-- **Precondition**: `es.door = Open`
-- **Effect**: `es.door' = Closed`
+- **Precondition**: the door of the car `e` is open.
+- **Effect**: the door closes.
 
 ### Network
 
 #### deliver(m)
-- **Effect**: dispatch on the kind of `m` to `receiveHallCall`, `receiveAssign`,
-  `receiveStatus`, or `receiveServed`.
+- **Effect**: performs the reaction that matches the kind of message `m`:
+  `receiveHallCall`, `receiveAssign`, `receiveStatus` or `receiveServed`.
 
 #### deliverAny
-- **Precondition**: `network ≠ {}`
-- **Effect**: `nondet m ∈ network`, then `deliver(m)`
+- **Precondition**: the network is not empty.
+- **Effect**: one message from the network is chosen non deterministically,
+  this choice is named `m`, and `deliver(m)` is performed.
 
 ### step
-- `nondet e ∈ ELEVATORS`, `nondet f ∈ FLOORS`, `nondet c ∈ HALL_CALLS`, then exactly one of:
-  `pressHallButton(c)`, `pressCarButton(e, f)`, `assignCall(c)`, `departure(e)`,
-  `travel(e)`, `openDoor(e)`, `closeDoor(e)`, `deliverAny`.
-- All nondet names (`e`, `f`, `c`, `target`, `m`) must be unique: recorded
-  executions identify choices by name.
+
+First an elevator named `e`, a floor named `f` and a hall call named `c` are
+chosen non deterministically. Then exactly one of these happens:
+`pressHallButton(c)`, `pressCarButton(e, f)`, `assignCall(c)`,
+`departure(e)`, `travel(e)`, `openDoor(e)`, `closeDoor(e)` or `deliverAny`.
+
+Every non deterministic choice has its own unique name (`e`, `f`, `c`,
+`target`, `m`), because recorded executions identify choices by name.
 
 ## Safety Invariants
 
-- **INV-01 doorsClosedWhileRunning**: `motor = Running ⇒ door = Closed` for every car.
-- **INV-02 staysInShaft**: `floor ∈ FLOORS` for every car.
-- **INV-03 runningHasHeading**: `motor = Running ⇒ heading ≠ Idle` for every car.
-- **INV-04 runningHasTargetAhead**: `motor = Running ⇒ ∃ t ∈ targets(es): (t - floor) · delta(heading) > 0`.
-- **INV-05 noDoubleService**: for every `c ∈ HALL_CALLS`, at most one elevator `e` has
-  `c ∈ hallStops(e) ∨ AssignMsg({ elevator: e, call: c }) ∈ network`.
-- **INV-06 assignmentConsistent**: `c ∈ hallStops(e) ⇒ assigned[c] = e`.
-- **INV-07 noLostHallCall**: every `c ∈ hallLamps` is in exactly one of
-  `HallCallMsg(c) ∈ network`, `c ∈ pending`, `c ∈ keys(assigned)`.
-- **INV-08 assignedCallIsTracked**: for `assigned[c] = e`: `AssignMsg({e, c}) ∈ network ∨
-  c ∈ hallStops(e) ∨ ServedMsg({e, c}) ∈ network`.
-- **INV-09 noTrackingWithoutLamp**: `pending ∪ keys(assigned) ⊆ hallLamps`.
-- **safety** = INV-01 ∧ … ∧ INV-09.
+- **INV-01 doorsClosedWhileRunning**: a moving car always has its door closed.
+- **INV-02 staysInShaft**: every car is always on a floor that exists.
+- **INV-03 runningHasHeading**: a moving car is never idle.
+- **INV-04 runningHasTargetAhead**: a moving car always has some target ahead
+  of it in the direction it is going.
+- **INV-05 noDoubleService**: no hall call belongs to more than one elevator,
+  counting both the elevators' hall stops and assignment messages on the way.
+- **INV-06 assignmentConsistent**: when a call is among an elevator's hall
+  stops, the dispatcher has it assigned to that same elevator.
+- **INV-07 noLostHallCall**: every lit lamp is tracked in exactly one place:
+  as a hall call message on the way, as pending, or as assigned.
+- **INV-08 assignedCallIsTracked**: every assigned call is on its way to its
+  elevator, held in that elevator's hall stops, or on its way back as a served
+  message.
+- **INV-09 noTrackingWithoutLamp**: the dispatcher never tracks a call, pending
+  or assigned, whose lamp is off.
+- **safety**: all of the above together.
 
 ## Liveness Properties
 
-Hold only under weak fairness of all actions (temporal properties).
+These hold only if every action that stays possible eventually happens.
 
-- **LIV-01 hallCallsEventuallyServed**: `□(c ∈ hallLamps ⇒ ◇(c ∉ hallLamps))` for every `c`.
-- **LIV-02 carCallsEventuallyServed**: `□(f ∈ carCalls(e) ⇒ ◇(f ∉ carCalls(e)))` for every `e`, `f`.
+- **LIV-01 hallCallsEventuallyServed**: every lit hall lamp eventually goes off.
+- **LIV-02 carCallsEventuallyServed**: every floor selected in a car is
+  eventually served.
 
 ## Witnesses
 
-Expected to be **violated**; a violation proves the situation is reachable.
+These are expected to be violated: a violation proves that the situation can
+happen.
 
-- **WIT-01 witnessBothRunning**: `¬(∀ e: motor(e) = Running)`
-- **WIT-02 witnessHallCallServed**: `¬(∃ ServedMsg ∈ network)`
-- **WIT-03 witnessStaleKnowledge**: `∀ e: known[e].floor = floor(e)`
+- **WIT-01 witnessBothRunning**: both cars are moving at the same time.
+- **WIT-02 witnessHallCallServed**: some served message is in the network.
+- **WIT-03 witnessStaleKnowledge**: the dispatcher believes some elevator is on
+  a different floor than it really is.
 
 ## Test Scenarios
 
-`call2Down = { floor: 2, dir: Down }`.
+`call2Down` is the hall call on floor 2 going down.
 
-- **hallCallLifecycleTest**: `pressHallButton(call2Down)` → deliver its `HallCallMsg`
-  (`pending = {call2Down}`) → `assignTo(call2Down, "A")` → deliver the `AssignMsg` →
-  `departure("A")` (`heading = Going(Up)`) → `travel("A")` (still `Running`) →
-  `travel("A")` (`floor = 2`, `Stopped`) → `openDoor("A")` (`Open`, `Idle`) → deliver
-  the `ServedMsg`. Expect `hallLamps = {}`, `assigned = {}`, `safety`.
-- **litButtonIsIgnoredTest**: `pressHallButton(call2Down)` twice fails.
-- **noDepartureWithOpenDoorTest**: `pressCarButton("A", 3)`, `departure("A")`, `travel("A")`,
-  `pressCarButton("A", 0)`, `travel("A")` ×2 (`floor = 3`), `openDoor("A")`; then
-  `departure("A")` fails.
-- **scanKeepsDirectionTest**: `pressCarButton("A", 2)`, `departure("A")`, `travel("A")`,
-  `pressCarButton("A", 0)`, `travel("A")`, `openDoor("A")`, `closeDoor("A")`,
-  `departure("A")`. Expect `heading = Going(Down)`, `safety`.
-- **closestElevatorIsChosenTest**: `pressCarButton("B", 3)`, `departure("B")`, `travel("B")`,
-  deliver `StatusMsg({ elevator: "B", floor: 1, seq: 1 })`, `pressHallButton({2, Up})`,
-  deliver its `HallCallMsg`; then `assignTo({2, Up}, "A")` fails.
+- **hallCallLifecycleTest**: the hall button for `call2Down` is pressed and its
+  message delivered, so it is the only pending call. It is assigned to "A" and
+  the assignment delivered. "A" departs going up, travels (still running),
+  travels again (now on floor 2 and stopped), and opens its doors (door open,
+  heading idle). The served message is delivered. At the end no lamp is lit,
+  nothing is assigned, and `safety` holds.
+- **litButtonIsIgnoredTest**: pressing the hall button for `call2Down` twice in
+  a row is not possible.
+- **noDepartureWithOpenDoorTest**: in "A" floor 3 is selected; "A" departs and
+  travels once; floor 0 is selected; "A" travels twice (now on floor 3) and
+  opens its doors. Departing now is not possible.
+- **scanKeepsDirectionTest**: in "A" floor 2 is selected; "A" departs and
+  travels once; floor 0 is selected; "A" travels, opens and closes its doors,
+  and departs. It is now going down, and `safety` holds.
+- **closestElevatorIsChosenTest**: in "B" floor 3 is selected; "B" departs and
+  travels once; the dispatcher receives the report that "B" is on floor 1
+  (report number 1); the hall button for floor 2 going up is pressed and its
+  message delivered. Assigning that call to "A" is not possible.
 
 ## Bounds for Model Checking
 
-- `NUM_FLOORS = 4`, `ELEVATORS = { "A", "B" }`
-- `MAX_STEPS = 60` per simulated execution
-- `quint run --invariant=safety --max-samples=1000 --max-steps=60` must report no violation.
-- `quint run --invariant=<WIT-xx>` must report a violation.
+- 4 floors and 2 elevators.
+- Random simulation of up to 60 steps per execution must never violate
+  `safety`.
+- Random simulation must find a violation of every witness.
 
 ## Output
 
-A single file `spec/elevator.qnt`, module `elevator`, comments in English, using
-exactly the names above. Nothing else.
+A single file `spec/elevator.qnt` with one module named `elevator`, comments
+in English, using exactly the names given above. Nothing else.

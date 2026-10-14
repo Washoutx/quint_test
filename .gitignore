@@ -1,4 +1,4 @@
 build/
-traces/
 _apalache-out/
+.cache/
 .DS_Store

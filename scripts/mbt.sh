@@ -21,20 +21,29 @@ if [[ -n "${SEED:-}" ]]; then SEED_ARGS=(--seed="$SEED"); fi
 
 step() { printf '\n==> %s\n' "$*"; }
 
+# Prints only the verdict line on success, the whole counterexample on a violation.
+quint_run() {
+  local out
+  if ! out=$(quint run "$SPEC" "$@" ${SEED_ARGS[@]+"${SEED_ARGS[@]}"} 2>&1); then
+    echo "$out"
+    exit 1
+  fi
+  echo "$out" | grep -E '^\[(ok|violation)\]'
+}
+
 step "Quint: typecheck and tests"
 quint typecheck "$SPEC"
 quint test "$SPEC"
 
-step "Quint: simulate, checking invariant 'safety'"
-quint run "$SPEC" --invariant=safety --max-samples=1000 --max-steps="$MAX_STEPS" \
-  ${SEED_ARGS[@]+"${SEED_ARGS[@]}"} | tail -n 4
+step "Quint: simulate 1000 executions, checking invariant 'safety'"
+quint_run --invariant=safety --max-samples=1000 --max-steps="$MAX_STEPS"
 
-step "Quint: generate $N_TRACES ITF traces"
+step "Quint: generate $N_TRACES ITF traces, checking invariant 'safety' in every state"
 rm -rf "$TRACES"
 mkdir -p "$TRACES"
-quint run "$SPEC" --mbt \
+quint_run --mbt --invariant=safety \
   --max-samples="$N_TRACES" --n-traces="$N_TRACES" --max-steps="$MAX_STEPS" \
-  --out-itf="$TRACES/trace_{seq}.itf.json" ${SEED_ARGS[@]+"${SEED_ARGS[@]}"} >/dev/null
+  --out-itf="$TRACES/trace_{seq}.itf.json"
 
 step "C++: build"
 cmake -S "$ROOT" -B "$BUILD" >/dev/null

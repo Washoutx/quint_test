@@ -100,13 +100,20 @@ at a floor serves all of its hall calls there).
   2. Otherwise, if it is going down and has a target below it, it goes down.
   3. Otherwise, if it has any target above it, it goes up.
   4. Otherwise it goes down.
-- `closestElevators`: for a given floor, the elevators whose position, as the
+- `closestElevators`: takes the dispatcher state and a floor, and returns the
+  elevators whose position, as the
   dispatcher knows it, is nearest to that floor. When several are equally
   near, all of them are returned. Only the dispatcher's knowledge is used,
   never the real positions of the cars.
 - `without`: a map of assigned calls with one call removed.
 
 Every operation below leaves unchanged everything it does not mention.
+
+The receive operations take the content carried by a message, not the
+message itself: `receiveHallCall` takes the hall call, and `receiveStatus`,
+`receiveServed` and `receiveAssign` take the record carried by their kind of
+message. The message they look for in the network is that content wrapped in
+the matching kind of message.
 
 ## Operations
 
@@ -248,8 +255,9 @@ These hold only if every action that stays possible eventually happens.
 
 ## Witnesses
 
-These are expected to be violated: a violation proves that the situation can
-happen.
+Each witness is written as an invariant stating that the situation never
+happens, so it is expected to be violated: a violation proves that the
+situation can happen.
 
 - **WIT-01 witnessBothRunning**: both cars are moving at the same time.
 - **WIT-02 witnessHallCallServed**: some served message is in the network.
@@ -258,11 +266,14 @@ happen.
 
 ## Test Scenarios
 
-`call2Down` is the hall call on floor 2 going down.
+`call2Down` is the hall call on floor 2 going down. Every test starts from the
+initial state. Messages are delivered with `deliver`, giving the exact message.
+"Not possible" means the test ends with the expectation that the last step
+fails.
 
 - **hallCallLifecycleTest**: the hall button for `call2Down` is pressed and its
-  message delivered, so it is the only pending call. It is assigned to "A" and
-  the assignment delivered. "A" departs going up, travels (still running),
+  message delivered, so it is the only pending call. It is assigned to "A"
+  with `assignTo` and the assignment delivered. "A" departs going up, travels (still running),
   travels again (now on floor 2 and stopped), and opens its doors (door open,
   heading idle). The served message is delivered. At the end no lamp is lit,
   nothing is assigned, and `safety` holds.
@@ -277,7 +288,8 @@ happen.
 - **closestElevatorIsChosenTest**: in "B" floor 3 is selected; "B" departs and
   travels once; the dispatcher receives the report that "B" is on floor 1
   (report number 1); the hall button for floor 2 going up is pressed and its
-  message delivered. Assigning that call to "A" is not possible.
+  message delivered. Assigning that call to "A" with `assignTo` is not
+  possible.
 
 ## Bounds for Model Checking
 

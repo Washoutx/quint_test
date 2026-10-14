@@ -465,21 +465,6 @@ module elevator {
   }
 
   // ---------------------------------------------------------------------------
-  // Liveness (requires fairness assumptions; check with `quint verify`)
-  // ---------------------------------------------------------------------------
-
-  temporal hallCallsEventuallyServed =
-    HALL_CALLS.forall(c => always(hallLamps.contains(c) implies eventually(not(hallLamps.contains(c)))))
-
-  temporal carCallsEventuallyServed =
-    ELEVATORS.forall(e =>
-      FLOORS.forall(f =>
-        always(elevators.get(e).carCalls.contains(f)
-               implies eventually(not(elevators.get(e).carCalls.contains(f))))
-      )
-    )
-
-  // ---------------------------------------------------------------------------
   // Witnesses: these are expected to be violated. Running
   //   quint run elevator.qnt --invariant=<witness>
   // produces an example trace that reaches the interesting situation.

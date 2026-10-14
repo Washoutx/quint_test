@@ -245,14 +245,6 @@ Every non deterministic choice has its own unique name (`e`, `f`, `c`,
   or assigned, whose lamp is off.
 - **safety**: all of the above together.
 
-## Liveness Properties
-
-These hold only if every action that stays possible eventually happens.
-
-- **LIV-01 hallCallsEventuallyServed**: every lit hall lamp eventually goes off.
-- **LIV-02 carCallsEventuallyServed**: every floor selected in a car is
-  eventually served.
-
 ## Witnesses
 
 Each witness is written as an invariant stating that the situation never

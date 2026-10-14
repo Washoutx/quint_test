@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(quin_cpp_easier LANGUAGES CXX)
+project(quint_cpp_elevator LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,7 +27,12 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(nlohmann_json googletest)
 
-add_library(elevator src/elevator.cpp)
+add_library(elevator
+  src/elevator_system.cpp
+  src/environment.cpp
+  src/dispatcher.cpp
+  src/controller.cpp
+)
 target_include_directories(elevator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(NOT MSVC)
   target_compile_options(elevator PRIVATE -Wall -Wextra -Wpedantic)
@@ -37,7 +42,7 @@ enable_testing()
 include(GoogleTest)
 
 add_executable(elevator_tests tests/ElevatorTests.cpp)
-target_link_libraries(elevator_tests PRIVATE elevator GTest::gtest_main)
+target_link_libraries(elevator_tests PRIVATE elevator nlohmann_json::nlohmann_json GTest::gtest_main)
 gtest_discover_tests(elevator_tests)
 
 set(MBT_TRACES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/traces CACHE PATH "Directory with Quint ITF traces")

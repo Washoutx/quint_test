@@ -3,7 +3,7 @@
 #
 # Environment:
 #   N_TRACES   number of traces to generate        (default 50)
-#   MAX_STEPS  steps per trace                     (default 40)
+#   MAX_STEPS  steps per trace                     (default 60)
 #   SEED       Quint seed, for reproducible traces (default: random)
 
 set -euo pipefail
@@ -15,7 +15,7 @@ BUILD="$ROOT/build"
 LOG="$BUILD/mbt_last.log"
 
 N_TRACES="${N_TRACES:-50}"
-MAX_STEPS="${MAX_STEPS:-40}"
+MAX_STEPS="${MAX_STEPS:-60}"
 SEED_ARGS=()
 if [[ -n "${SEED:-}" ]]; then SEED_ARGS=(--seed="$SEED"); fi
 

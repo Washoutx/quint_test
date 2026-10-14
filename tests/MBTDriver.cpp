@@ -12,12 +12,13 @@
 #include <iostream>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "TestSupport.hpp"
-#include "elevator.hpp"
+#include "elevator/elevator_system.hpp"
 
 #ifndef MBT_DEFAULT_TRACES_DIR
 #define MBT_DEFAULT_TRACES_DIR "traces"
@@ -28,36 +29,122 @@ namespace {
 namespace fs = std::filesystem;
 using nlohmann::json;
 using namespace elevator;
-using elevator::test::toString;
+using elevator::test::toJson;
 using elevator::test::violatedInvariants;
 
 // ---------------------------------------------------------------------------
 // ITF parsing
 // ---------------------------------------------------------------------------
 
-int toInt(const json& j) {
-    if (j.is_number_integer()) return j.get<int>();
-    return std::stoi(j.at("#bigint").get<std::string>());
+[[noreturn]] void fail(const std::string& what, const json& j) {
+    throw std::runtime_error("ITF: " + what + ": " + j.dump());
 }
 
-std::string tagOf(const json& j) { return j.at("tag").get<std::string>(); }
+const json& setItems(const json& j) {
+    if (!j.is_object() || !j.contains("#set")) fail("expected a set", j);
+    return j.at("#set");
+}
 
-ElevatorState parseState(const json& j) {
-    ElevatorState s;
-    s.floor = toInt(j.at("floor"));
+const json& mapItems(const json& j) {
+    if (!j.is_object() || !j.contains("#map")) fail("expected a map", j);
+    return j.at("#map");
+}
 
-    const auto door = tagOf(j.at("door"));
-    if (door == "Open") s.door = Door::Open;
-    else if (door == "Closed") s.door = Door::Closed;
-    else throw std::runtime_error("unknown Door: " + door);
+int toInt(const json& j) {
+    if (j.is_number_integer()) return j.get<int>();
+    if (j.is_object() && j.contains("#bigint")) return std::stoi(j.at("#bigint").get<std::string>());
+    fail("expected an integer", j);
+}
 
-    const auto dir = tagOf(j.at("direction"));
-    if (dir == "Up") s.direction = Direction::Up;
-    else if (dir == "Down") s.direction = Direction::Down;
-    else if (dir == "Idle") s.direction = Direction::Idle;
-    else throw std::runtime_error("unknown Direction: " + dir);
+std::string tagOf(const json& j) {
+    if (!j.is_object() || !j.contains("tag")) fail("expected a variant", j);
+    return j.at("tag").get<std::string>();
+}
 
-    for (const auto& r : j.at("requests").at("#set")) s.requests.insert(toInt(r));
+// Payload of `Some(x)`, or nullptr for `None` or a missing pick.
+const json* pick(const json& picks, const std::string& name) {
+    if (!picks.contains(name)) return nullptr;
+    const auto& opt = picks.at(name);
+    return tagOf(opt) == "Some" ? &opt.at("value") : nullptr;
+}
+
+const json& requirePick(const json& picks, const std::string& name) {
+    const json* v = pick(picks, name);
+    if (!v) fail("missing nondet pick '" + name + "'", picks);
+    return *v;
+}
+
+Dir parseDir(const json& j) {
+    const auto tag = tagOf(j);
+    if (tag == "Up") return Dir::Up;
+    if (tag == "Down") return Dir::Down;
+    fail("unknown Dir", j);
+}
+
+Heading parseHeading(const json& j) {
+    const auto tag = tagOf(j);
+    if (tag == "Idle") return Heading::Idle;
+    if (tag == "Going") return parseDir(j.at("value")) == Dir::Up ? Heading::GoingUp : Heading::GoingDown;
+    fail("unknown Heading", j);
+}
+
+Door parseDoor(const json& j) {
+    const auto tag = tagOf(j);
+    if (tag == "Open") return Door::Open;
+    if (tag == "Closed") return Door::Closed;
+    fail("unknown Door", j);
+}
+
+Motor parseMotor(const json& j) {
+    const auto tag = tagOf(j);
+    if (tag == "Stopped") return Motor::Stopped;
+    if (tag == "Running") return Motor::Running;
+    fail("unknown Motor", j);
+}
+
+HallCall parseHallCall(const json& j) { return HallCall{toInt(j.at("floor")), parseDir(j.at("dir"))}; }
+
+ElevatorState parseElevatorState(const json& j) {
+    ElevatorState es;
+    es.floor = toInt(j.at("floor"));
+    es.door = parseDoor(j.at("door"));
+    es.motor = parseMotor(j.at("motor"));
+    es.heading = parseHeading(j.at("heading"));
+    for (const auto& f : setItems(j.at("carCalls"))) es.carCalls.insert(toInt(f));
+    for (const auto& c : setItems(j.at("hallStops"))) es.hallStops.insert(parseHallCall(c));
+    es.statusSeq = toInt(j.at("statusSeq"));
+    return es;
+}
+
+DispatcherState parseDispatcherState(const json& j) {
+    DispatcherState d;
+    for (const auto& c : setItems(j.at("pending"))) d.pending.insert(parseHallCall(c));
+    for (const auto& kv : mapItems(j.at("assigned"))) d.assigned[parseHallCall(kv.at(0))] = kv.at(1).get<std::string>();
+    for (const auto& kv : mapItems(j.at("known"))) {
+        const auto& r = kv.at(1);
+        d.known[kv.at(0).get<std::string>()] = PositionReport{toInt(r.at("floor")), toInt(r.at("seq"))};
+    }
+    return d;
+}
+
+Message parseMessage(const json& j) {
+    const auto tag = tagOf(j);
+    const auto& v = j.at("value");
+    if (tag == "HallCallMsg") return HallCallMsg{parseHallCall(v)};
+    if (tag == "AssignMsg") return AssignMsg{v.at("elevator").get<std::string>(), parseHallCall(v.at("call"))};
+    if (tag == "StatusMsg") return StatusMsg{v.at("elevator").get<std::string>(), toInt(v.at("floor")), toInt(v.at("seq"))};
+    if (tag == "ServedMsg") return ServedMsg{v.at("elevator").get<std::string>(), parseHallCall(v.at("call"))};
+    fail("unknown Message", j);
+}
+
+SystemState parseState(const json& j) {
+    SystemState s;
+    for (const auto& kv : mapItems(j.at("elevators"))) {
+        s.elevators[kv.at(0).get<std::string>()] = parseElevatorState(kv.at(1));
+    }
+    s.dispatcher = parseDispatcherState(j.at("dispatcher"));
+    for (const auto& c : setItems(j.at("hallLamps"))) s.hallLamps.insert(parseHallCall(c));
+    for (const auto& m : setItems(j.at("network"))) s.network.insert(parseMessage(m));
     return s;
 }
 
@@ -86,29 +173,88 @@ std::vector<std::string> discoverTraces() {
 // Replay
 // ---------------------------------------------------------------------------
 
-// Translates one ITF transition into the corresponding Elevator call.
-bool applyStep(Elevator& e, const std::string& action, const json& picks, std::string& call) {
-    if (action == "request") {
-        const int f = toInt(picks.at("f").at("value"));
-        call = "request(" + std::to_string(f) + ")";
-        return e.request(f);
+struct StepResult {
+    bool enabled = false;
+    std::string call;
+};
+
+// Translates one ITF transition into the corresponding ElevatorSystem call.
+StepResult applyStep(ElevatorSystem& sys, const std::string& action, const json& picks, const SystemState& expected) {
+    auto elevatorPick = [&] { return requirePick(picks, "e").get<std::string>(); };
+
+    if (action == "pressHallButton") {
+        const auto c = parseHallCall(requirePick(picks, "c"));
+        return {sys.pressHallButton(c), "pressHallButton(" + toJson(c).dump() + ")"};
     }
-    call = action + "()";
-    if (action == "openDoor") return e.openDoor();
-    if (action == "closeDoor") return e.closeDoor();
-    if (action == "move") return e.move();
+    if (action == "pressCarButton") {
+        const auto e = elevatorPick();
+        const int f = toInt(requirePick(picks, "f"));
+        return {sys.pressCarButton(e, f), "pressCarButton(" + e + ", " + std::to_string(f) + ")"};
+    }
+    if (action == "assignCall") {
+        const auto c = parseHallCall(requirePick(picks, "c"));
+        std::string target;
+        if (const json* t = pick(picks, "target")) {
+            target = t->get<std::string>();
+        } else if (auto it = expected.dispatcher.assigned.find(c); it != expected.dispatcher.assigned.end()) {
+            target = it->second;
+        } else {
+            return {false, "assignCall(" + toJson(c).dump() + "): no target in trace"};
+        }
+        return {sys.assignTo(c, target), "assignTo(" + toJson(c).dump() + ", " + target + ")"};
+    }
+    if (action == "departure") {
+        const auto e = elevatorPick();
+        return {sys.departure(e), "departure(" + e + ")"};
+    }
+    if (action == "travel") {
+        const auto e = elevatorPick();
+        return {sys.travel(e), "travel(" + e + ")"};
+    }
+    if (action == "openDoor") {
+        const auto e = elevatorPick();
+        return {sys.openDoor(e), "openDoor(" + e + ")"};
+    }
+    if (action == "closeDoor") {
+        const auto e = elevatorPick();
+        return {sys.closeDoor(e), "closeDoor(" + e + ")"};
+    }
+    if (action == "deliverAny") {
+        const auto m = parseMessage(requirePick(picks, "m"));
+        return {sys.deliver(m), "deliver(" + toJson(m).dump() + ")"};
+    }
     throw std::runtime_error("unknown action in trace: " + action);
 }
 
-std::string report(const std::string& trace, size_t index, const std::string& call, const ElevatorState& before,
-                   const ElevatorState& expected, const ElevatorState& actual) {
-    return "\n=== MBT DIVERGENCE ===\n"
-           "trace:    " + trace + "\n"
-           "step:     " + std::to_string(index) + "\n"
-           "C++ call: " + call + "\n"
-           "before:   " + toString(before) + "\n"
-           "expected: " + toString(expected) + "   (Quint)\n"
-           "actual:   " + toString(actual) + "   (C++)\n";
+std::string report(const std::string& trace, size_t index, const std::string& action, const std::string& call,
+                   const SystemState& before, const SystemState& expected, const SystemState& actual) {
+    std::ostringstream out;
+    out << "\n=== MBT DIVERGENCE ===\n"
+        << "trace:    " << trace << "\n"
+        << "step:     " << index << "\n"
+        << "action:   " << action << "\n"
+        << "C++ call: " << call << "\n"
+        << "--- state before step ---\n"
+        << toJson(before).dump(2) << "\n"
+        << "--- expected (Quint) ---\n"
+        << toJson(expected).dump(2) << "\n"
+        << "--- actual (C++) ---\n"
+        << toJson(actual).dump(2) << "\n"
+        << "--- diff (JSON patch: actual -> expected) ---\n"
+        << json::diff(toJson(actual), toJson(expected)).dump(2) << "\n";
+    return out.str();
+}
+
+std::string differingVars(const ElevatorSystem& sys, const SystemState& expected) {
+    std::string out;
+    auto check = [&](bool same, const char* var) {
+        if (!same) out += (out.empty() ? "" : ", ") + std::string(var);
+    };
+    check(sys.elevators() == expected.elevators, "elevators");
+    check(sys.dispatcher() == expected.dispatcher, "dispatcher");
+    check(sys.hallLamps() == expected.hallLamps, "hallLamps");
+    check(sys.network() == expected.network, "network");
+    return out;
 }
 
 class MBTDriver : public ::testing::TestWithParam<std::string> {
@@ -132,28 +278,32 @@ TEST_P(MBTDriver, ReplaysTrace) {
     ASSERT_TRUE(in) << "cannot open " << path;
     const json states = json::parse(in).at("states");
     ASSERT_FALSE(states.empty());
+    ASSERT_EQ(states.at(0).at("mbt::actionTaken").get<std::string>(), "init")
+        << path << ": trace was not generated with --mbt";
 
-    Elevator e;
-    e.init();
+    ElevatorSystem sys;
+    sys.init();
     const auto initial = parseState(states.at(0));
-    ASSERT_TRUE(e.state() == initial) << report(path, 0, "init()", ElevatorState{}, initial, e.state());
+    const auto initDiff = differingVars(sys, initial);
+    ASSERT_TRUE(initDiff.empty()) << "C++ state differs from Quint state in: " << initDiff
+                                  << report(path, 0, "init", "init()", SystemState{}, initial, sys.state());
 
     for (size_t i = 1; i < states.size(); ++i) {
         const json& st = states.at(i);
         const auto action = st.at("mbt::actionTaken").get<std::string>();
         const auto expected = parseState(st);
-        const auto before = e.state();
+        const auto before = sys.state();
 
-        std::string call;
-        const bool enabled = applyStep(e, action, st.at("mbt::nondetPicks"), call);
-        ASSERT_TRUE(enabled) << "C++ rejected an action that Quint took (guard mismatch)"
-                             << report(path, i, call, before, expected, e.state());
-        ASSERT_TRUE(e.state() == expected) << "C++ state differs from Quint state"
-                                           << report(path, i, call, before, expected, e.state());
+        const auto result = applyStep(sys, action, st.at("mbt::nondetPicks"), expected);
+        ASSERT_TRUE(result.enabled) << "C++ rejected an action that Quint took (guard mismatch)"
+                                    << report(path, i, action, result.call, before, expected, sys.state());
+        const auto diff = differingVars(sys, expected);
+        ASSERT_TRUE(diff.empty()) << "C++ state differs from Quint state in: " << diff
+                                  << report(path, i, action, result.call, before, expected, sys.state());
 
-        const auto violated = violatedInvariants(e.state());
+        const auto violated = violatedInvariants(sys.config(), sys.state());
         ASSERT_TRUE(violated.empty()) << "C++ invariant violated: " << violated.front()
-                                      << report(path, i, call, before, expected, e.state());
+                                      << report(path, i, action, result.call, before, expected, sys.state());
         ++actionCounts[action];
     }
 
